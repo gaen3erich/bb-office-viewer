@@ -3,7 +3,7 @@
 // extracts its text and the viewer shows that. Both can be searched, zoomed
 // and quoted into the chat.
 import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
-import type { CSSProperties, KeyboardEvent } from "react";
+import type { KeyboardEvent } from "react";
 import { useComposer, useRpc, type PluginFileOpenerProps } from "@get-bb/plugin-sdk/app";
 import { renderAsync } from "docx-preview";
 import { toast } from "sonner";
@@ -30,13 +30,6 @@ const BULLET_PATTERN = new RegExp(`[${Object.keys(BULLETS).join("")}]`, "g");
 const HIGHLIGHT = "office-find";
 const HIGHLIGHT_CURRENT = "office-find-current";
 const HIGHLIGHT_CSS = `::highlight(${HIGHLIGHT}){background-color:#fde68a;color:#000}::highlight(${HIGHLIGHT_CURRENT}){background-color:#f59e0b;color:#000}`;
-/** Force a stable compositing layer on the editable root so text does not go blurry when Chromium/Electron makes it contenteditable inside a zoomed page. */
-const WYSIWYG_EDIT_STYLE: CSSProperties = {
-  transform: "translateZ(0)",
-  willChange: "transform",
-  textRendering: "geometricPrecision",
-  WebkitFontSmoothing: "antialiased",
-};
 const ZOOM_STEPS = [0.25, 0.33, 0.5, 0.67, 0.75, 0.9, 1, 1.1, 1.25, 1.5, 1.75, 2, 2.5, 3];
 /** The browser's highlight registry (typed as a Map: the DOM typings leave out its methods), or null where unsupported. */
 const highlightRegistry = () => (typeof CSS !== "undefined" && "highlights" in CSS ? (CSS.highlights as unknown as Map<string, Highlight>) : null);
@@ -259,6 +252,7 @@ export function DocumentOpener({ path, source }: PluginFileOpenerProps) {
   const styles = useRef<HTMLDivElement>(null);
   const plain = useRef<HTMLDivElement>(null);
   const pageWidth = useRef(0);
+  const naturalSize = useRef<{ w: number; h: number } | null>(null);
   const zoomMode = useRef<Zoom>("auto");
   const generation = useRef(0);
   const [editing, setEditing] = useState(false);
@@ -276,9 +270,28 @@ export function DocumentOpener({ path, source }: PluginFileOpenerProps) {
     const natural = pageWidth.current ? viewport.current.clientWidth / pageWidth.current : 1;
     const mode = zoomMode.current;
     const next = typeof mode === "number" ? mode : mode === "width" ? Math.min(4, natural) : Math.min(1, natural);
-    target.style.setProperty("zoom", String(next));
-    // Word centres its pages: without a minimum width the left part of a page zoomed past the panel can't be scrolled to.
-    target.style.setProperty("min-width", pageWidth.current ? "max-content" : "");
+
+    // Scaling with `zoom` rasterizes editable text at a fractional scale in WebView/Electron, which makes it
+    // blurry once content becomes contenteditable. `transform: scale` scales the composited raster instead, so the
+    // text stays crisp. Unlike `zoom`, `transform` does not change layout size, so we also size the layout box to
+    // the visual (scaled) dimensions to keep the scroll bar honest.
+    target.style.setProperty("zoom", "");
+    target.style.transformOrigin = "top center";
+    const naturalW = pageWidth.current || target.offsetWidth;
+    let naturalH: number;
+    if (naturalSize.current && naturalSize.current.w === naturalW) {
+      naturalH = naturalSize.current.h;
+    } else {
+      target.style.transform = "none";
+      target.style.width = "";
+      target.style.height = "";
+      naturalH = target.offsetHeight;
+      naturalSize.current = { w: naturalW, h: naturalH };
+    }
+    target.style.transform = `scale(${next})`;
+    target.style.width = `${naturalW * next}px`;
+    target.style.height = `${naturalH * next}px`;
+    target.style.setProperty("min-width", "");
     setScale(next);
   }, []);
 
@@ -884,7 +897,6 @@ export function DocumentOpener({ path, source }: PluginFileOpenerProps) {
                 contentEditable={editing && editMode === "wysiwyg"}
                 suppressContentEditableWarning
                 className={cn(editing && editMode === "wysiwyg" && "rounded-sm ring-2 ring-primary/30")}
-                style={editing && editMode === "wysiwyg" ? WYSIWYG_EDIT_STYLE : undefined}
               />
             )}
           </div>
