@@ -1,31 +1,40 @@
 # Office Viewer for BB
 
-Office Viewer adds file openers to BB for spreadsheets, Word documents, PowerPoint presentations, PDFs, HTML pages, images, video and audio. Its thread Studio panel also creates wireframe prototypes, slide decks and paint canvases.
+A fork of [bb-plugin-office-viewer](https://github.com/VKirill/bb-plugin-office-viewer) with two additions that make it usable on **Windows** and let you **edit** Word documents:
 
-## Quick start
+1. **Windows path fix** — the upstream crashed on Windows paths (`C:\...`) because it looked for `/` as the path separator. The fork resolves the document directory and file name with `path.dirname()` / `path.basename()` instead of `lastIndexOf("/")`.
+2. **Word (.docx) editing** — the **Edit document** button enters a seamless, in-place (WYSIWYG) editing mode over the rendered pages, and a structured paragraph-list view is available too. Saving rewrites only `word/document.xml`; tables, images, styles and numbering are preserved.
 
-```sh
-npm install
-npm run build
-bb plugin install .
+## What it opens
+
+`.docx`, `.docm`, `.dotx`, `.xlsx`, `.xls`, `.ods`, `.csv`, `.pptx`, `.pdf`, images, video, audio and HTML — with search, zoom, quoting into chat, and saving without losing formatting.
+
+## Install on a new machine
+
+Requires [BB](https://getbb.app) on the machine. On PowerShell:
+
+```powershell
+# 1. Set the repository URL in setup.ps1 first (it points at YOUR_USER by default)
+# 2. Run the setup script
+./setup.ps1
 ```
 
-Requires BB 0.43 or later. Choose Office Viewer in BB Settings → File openers if another plugin claims the same extensions.
+or install it directly:
 
-## Web loading safety
+```powershell
+bb plugin install git:https://github.com/YOUR_USER/bb-office-viewer.git --yes
+bb plugin list
+```
 
-Version 0.8.16 pins each request to validated public IP addresses, including redirects, with fallback among the checked addresses. DNS, connections, redirects and decoded response bodies share a 20-second deadline; decoded responses are limited to 20 MB. Internal and special-purpose ranges are blocked conservatively, so some special-purpose globally reachable addresses are intentionally unavailable. Web errors support English and Russian.
+## Development
 
-## PDF reading position
+```powershell
+npm install
+bb plugin build .
+bb plugin reload office-viewer
+```
 
-PDFs remember the page, position within the page, horizontal scroll and zoom per viewing thread in BB’s server-side plugin storage. Reopening that thread on another device restores its place. Refreshing keeps the current passage, and rapid close/reopen shares pending saves. Files opened outside a thread do not persist a reading position.
+## Notes
 
-## Documentation
-
-- [Project overview](docs/overview.md)
-- [Architecture](docs/architecture.md)
-- [Features](docs/features/spreadsheets.md): [spreadsheets](docs/features/spreadsheets.md), [Word and PowerPoint](docs/features/office-documents.md), [PDF](docs/features/pdf.md), [HTML on devices](docs/features/html-layout.md), [media](docs/features/media.md), [Studio](docs/features/studio.md)
-- [API](docs/api.md)
-- [Data model](docs/data-model.md)
-- [Deployment](docs/deployment.md)
-- [Gotchas](docs/gotchas.md)
+- This repository contains the plugin at its root; `node_modules/` and `dist/` are ignored in git, so BB builds them on install.
+- Updates from the upstream marketplace will not arrive automatically. Pull the upstream changes into this fork, rebuild (`bb plugin build .`), and commit.
