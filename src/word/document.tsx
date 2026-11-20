@@ -125,6 +125,17 @@ function findRanges(root: Node, needle: string): Range[] {
   return found;
 }
 
+/** Collects the top-level paragraphs rendered by docx-preview (section.docx > p, excluding any inside a table) in document order. */
+function collectWysiwygParagraphs(root: HTMLElement | null): { text: string }[] {
+  const out: { text: string }[] = [];
+  if (!root) return out;
+  root.querySelectorAll<HTMLElement>("section.docx p").forEach((paragraph) => {
+    if (paragraph.closest("table")) return;
+    out.push({ text: (paragraph.innerText ?? "").replace(/\u00a0/g, " ").replace(BULLET_PATTERN, (glyph: string) => BULLETS[glyph]).trim() });
+  });
+  return out;
+}
+
 export function DocumentOpener({ path, source }: PluginFileOpenerProps) {
   const rpc = useRpc<typeof rpcContract>();
   const composer = useComposer();
@@ -167,7 +178,9 @@ export function DocumentOpener({ path, source }: PluginFileOpenerProps) {
   const zoomMode = useRef<Zoom>("auto");
   const generation = useRef(0);
   const [editing, setEditing] = useState(false);
+  const [editMode, setEditMode] = useState<"wysiwyg" | "list" | null>(null);
   const [editable, setEditable] = useState<EditableParagraph[] | null>(null);
+  const [baseParagraphs, setBaseParagraphs] = useState<DocxParagraphLike[] | null>(null);
   const [docxSha, setDocxSha] = useState<string | null>(null);
   const [savingDoc, setSavingDoc] = useState(false);
   const [editError, setEditError] = useState<string | null>(null);
@@ -351,13 +364,21 @@ export function DocumentOpener({ path, source }: PluginFileOpenerProps) {
   const openEditor = async () => {
     try {
       const result = await rpc.call("docxModel", request);
-      setEditable(result.paragraphs.map(toEditable));
+      setBaseParagraphs(result.paragraphs);
       setDocxSha(result.sha256);
       setEditError(null);
+      setEditMode("wysiwyg");
       setEditing(true);
     } catch (cause) {
       toast.error(cause instanceof Error ? cause.message : String(cause));
     }
+  };
+
+  const openListEditor = () => {
+    if (!baseParagraphs) return;
+    setEditable(baseParagraphs.map(toEditable));
+    setEditMode("list");
+    setEditError(null);
   };
 
   const updateEditable = (index: number, patch: Partial<EditableParagraph>) => {
@@ -382,7 +403,9 @@ export function DocumentOpener({ path, source }: PluginFileOpenerProps) {
 
   const cancelEdit = () => {
     setEditing(false);
+    setEditMode(null);
     setEditable(null);
+    setBaseParagraphs(null);
     setEditError(null);
     void load();
   };
@@ -413,7 +436,57 @@ export function DocumentOpener({ path, source }: PluginFileOpenerProps) {
         setEditError(t("editConflict"));
       } else {
         setEditing(false);
+        setEditMode(null);
         setEditable(null);
+        setBaseParagraphs(null);
+        await load();
+        toast.success(t("editSaved"));
+      }
+    } catch (cause) {
+      setEditError(cause instanceof Error ? cause.message : String(cause));
+    } finally {
+      setSavingDoc(false);
+    }
+  };
+
+  const saveWysiwyg = async () => {
+    if (!baseParagraphs || !docxSha || !pages.current) return;
+    setSavingDoc(true);
+    setEditError(null);
+    try {
+      const dom = collectWysiwygParagraphs(pages.current);
+      const paragraphs = baseParagraphs.map((paragraph, index) => {
+        const text = (dom[index]?.text ?? paragraph.text).trim();
+        const bullet = paragraph.style === "listBullet" || paragraph.style === "listNumber";
+        if (text === paragraph.text) {
+          return { ...paragraph, bullet, level: 0, align: null };
+        }
+        const first = paragraph.runs[0];
+        return {
+          style: paragraph.style,
+          text,
+          runs: [
+            {
+              text,
+              bold: first?.bold ?? false,
+              italic: first?.italic ?? false,
+              underline: first?.underline ?? false,
+              strike: first?.strike ?? false,
+            },
+          ],
+          bullet,
+          level: 0,
+          align: null,
+        };
+      });
+      const result = await rpc.call("saveDocx", { ...request, expectedSha256: docxSha, paragraphs });
+      if (result.outcome === "conflict") {
+        setEditError(t("editConflict"));
+      } else {
+        setEditing(false);
+        setEditMode(null);
+        setEditable(null);
+        setBaseParagraphs(null);
         await load();
         toast.success(t("editSaved"));
       }
@@ -498,21 +571,27 @@ export function DocumentOpener({ path, source }: PluginFileOpenerProps) {
           <Icon name="MessageSquarePlus" className="size-4" />
         </Button></span>
         {!legacy ? (
-          <span
-            title={editing ? t("cancel") : t("editDocument")}
-            className={cn("shrink-0", editing ? "" : "")}
-          >
+          editing && !editable ? (
+            <span className="flex shrink-0 items-center gap-1">
+              <Button variant="ghost" size="sm" className="h-8" onClick={openListEditor} disabled={savingDoc} title={t("listView")}>
+                <Icon name="ListView" className="size-4" /> {t("editList")}
+              </Button>
+              <Button variant="ghost" size="sm" className="h-8" onClick={cancelEdit} disabled={savingDoc}>{t("cancel")}</Button>
+              <Button variant="default" size="sm" className="h-8 gap-1.5" onClick={() => void saveWysiwyg()} disabled={savingDoc}>
+                <Icon name={savingDoc ? "Spinner" : "Check"} className={savingDoc ? "size-4 animate-spin" : "size-4"} /> {t("save")}
+              </Button>
+            </span>
+          ) : !editing ? (
             <Button
-              variant={editing ? "secondary" : "outline"}
+              variant="outline"
               size="sm"
-              className={cn("h-8 gap-1.5", editing && "border-primary/40 text-primary")}
-              onClick={() => (editing ? cancelEdit() : void openEditor())}
+              className="h-8 gap-1.5"
+              onClick={() => void openEditor()}
               disabled={!info || savingDoc}
-              aria-pressed={editing}
             >
-              <Icon name="EditFile" className="size-4" /> {editing ? t("cancel") : t("editDocument")}
+              <Icon name="EditFile" className="size-4" /> {t("editDocument")}
             </Button>
-          </span>
+          ) : null
         ) : null}
         <span title={t("downloadHint")} className="shrink-0"><Button variant="ghost" size="sm" className="h-8 gap-1.5" onClick={() => void download()} disabled={!info}>
           <Icon name="Download" className="size-4" /> {t("download")}
@@ -606,7 +685,13 @@ export function DocumentOpener({ path, source }: PluginFileOpenerProps) {
                 </div>
               </div>
             ) : (
-              <div ref={pages} hidden={!!error} />
+              <div
+                ref={pages}
+                hidden={!!error}
+                contentEditable={editing && editMode === "wysiwyg"}
+                suppressContentEditableWarning
+                className={cn(editing && editMode === "wysiwyg" && "rounded-sm ring-2 ring-primary/30")}
+              />
             )}
           </div>
         </ContextMenuTrigger>
