@@ -12,8 +12,9 @@ import { Button } from "@/components/ui/button";
 import { ContextMenu, ContextMenuContent, ContextMenuItem, ContextMenuTrigger } from "@/components/ui/context-menu";
 import { Icon } from "@/components/ui/icon";
 import { Input } from "@/components/ui/input";
+import { Textarea } from "@/components/ui/textarea";
 import { cn } from "@/lib/utils";
-import { detectLocale, t } from "../shared/i18n";
+import { detectLocale, t, type I18nKey } from "../shared/i18n";
 import { formatSize } from "../shared/format";
 import { formatBlockquote } from "../shared/quote";
 import { extensionOf } from "../spreadsheet/sheet";
@@ -38,6 +39,51 @@ const BLOCKS = "p,li,td,th,h1,h2,h3,h4,h5,h6,div,article,section";
 type Zoom = "auto" | "width" | number;
 type Info = { hostName: string; absPath: string; sizeBytes: number };
 type LegacyText = { body: string; headers: string; footnotes: string; endnotes: string };
+
+type DocxParagraphStyle =
+  | "normal"
+  | "title"
+  | "subtitle"
+  | "heading1"
+  | "heading2"
+  | "heading3"
+  | "heading4"
+  | "quote"
+  | "listBullet"
+  | "listNumber";
+type EditableParagraph = {
+  style: DocxParagraphStyle;
+  text: string;
+  bold: boolean;
+  italic: boolean;
+  underline: boolean;
+  strike: boolean;
+};
+const STYLE_OPTIONS: { value: DocxParagraphStyle; labelKey: I18nKey }[] = [
+  { value: "normal", labelKey: "styleNormal" },
+  { value: "title", labelKey: "styleTitle" },
+  { value: "subtitle", labelKey: "styleSubtitle" },
+  { value: "heading1", labelKey: "styleHeading1" },
+  { value: "heading2", labelKey: "styleHeading2" },
+  { value: "heading3", labelKey: "styleHeading3" },
+  { value: "heading4", labelKey: "styleHeading4" },
+  { value: "quote", labelKey: "styleQuote" },
+  { value: "listBullet", labelKey: "styleListBullet" },
+  { value: "listNumber", labelKey: "styleListNumber" },
+];
+type DocxParagraphLike = {
+  style: DocxParagraphStyle;
+  text: string;
+  runs: { text: string; bold?: boolean; italic?: boolean; underline?: boolean; strike?: boolean }[];
+};
+const toEditable = (paragraph: DocxParagraphLike): EditableParagraph => ({
+  style: paragraph.style,
+  text: paragraph.text,
+  bold: paragraph.runs[0]?.bold ?? false,
+  italic: paragraph.runs[0]?.italic ?? false,
+  underline: paragraph.runs[0]?.underline ?? false,
+  strike: paragraph.runs[0]?.strike ?? false,
+});
 
 /** Every case-insensitive occurrence of `needle` in the text under `root`. Runs of one paragraph are searched together, because Word splits its text by formatting. */
 function findRanges(root: Node, needle: string): Range[] {
@@ -120,6 +166,11 @@ export function DocumentOpener({ path, source }: PluginFileOpenerProps) {
   const pageWidth = useRef(0);
   const zoomMode = useRef<Zoom>("auto");
   const generation = useRef(0);
+  const [editing, setEditing] = useState(false);
+  const [editable, setEditable] = useState<EditableParagraph[] | null>(null);
+  const [docxSha, setDocxSha] = useState<string | null>(null);
+  const [savingDoc, setSavingDoc] = useState(false);
+  const [editError, setEditError] = useState<string | null>(null);
 
   /** Scales the pages (or the plain text): by default down to the panel width, so a phone shows a whole page instead of scrolling sideways. */
   const fit = useCallback(() => {
@@ -297,6 +348,82 @@ export function DocumentOpener({ path, source }: PluginFileOpenerProps) {
     toast.success(t("quoted"));
   };
 
+  const openEditor = async () => {
+    try {
+      const result = await rpc.call("docxModel", request);
+      setEditable(result.paragraphs.map(toEditable));
+      setDocxSha(result.sha256);
+      setEditError(null);
+      setEditing(true);
+    } catch (cause) {
+      toast.error(cause instanceof Error ? cause.message : String(cause));
+    }
+  };
+
+  const updateEditable = (index: number, patch: Partial<EditableParagraph>) => {
+    setEditable((previous) => (previous ? previous.map((paragraph, i) => (i === index ? { ...paragraph, ...patch } : paragraph)) : previous));
+  };
+
+  const toggleFormat = (index: number, key: "bold" | "italic" | "underline" | "strike") => {
+    setEditable((previous) => (previous ? previous.map((paragraph, i) => (i === index ? { ...paragraph, [key]: !paragraph[key] } : paragraph)) : previous));
+  };
+
+  const addEditable = (index: number) => {
+    setEditable((previous) =>
+      previous
+        ? [...previous.slice(0, index + 1), { style: "normal", text: "", bold: false, italic: false, underline: false, strike: false }, ...previous.slice(index + 1)]
+        : previous,
+    );
+  };
+
+  const removeEditable = (index: number) => {
+    setEditable((previous) => (previous ? previous.filter((_, i) => i !== index) : previous));
+  };
+
+  const cancelEdit = () => {
+    setEditing(false);
+    setEditable(null);
+    setEditError(null);
+    void load();
+  };
+
+  const saveEdit = async () => {
+    if (!editable || !docxSha) return;
+    setSavingDoc(true);
+    setEditError(null);
+    try {
+      const paragraphs = editable.map((paragraph) => ({
+        style: paragraph.style,
+        text: paragraph.text,
+        runs: [
+          {
+            text: paragraph.text,
+            bold: paragraph.bold || undefined,
+            italic: paragraph.italic || undefined,
+            underline: paragraph.underline || undefined,
+            strike: paragraph.strike || undefined,
+          },
+        ],
+        bullet: paragraph.style === "listBullet" || paragraph.style === "listNumber",
+        level: 0,
+        align: null,
+      }));
+      const result = await rpc.call("saveDocx", { ...request, expectedSha256: docxSha, paragraphs });
+      if (result.outcome === "conflict") {
+        setEditError(t("editConflict"));
+      } else {
+        setEditing(false);
+        setEditable(null);
+        await load();
+        toast.success(t("editSaved"));
+      }
+    } catch (cause) {
+      setEditError(cause instanceof Error ? cause.message : String(cause));
+    } finally {
+      setSavingDoc(false);
+    }
+  };
+
   const onKeyDown = (event: KeyboardEvent) => {
     if (!(event.metaKey || event.ctrlKey) || event.altKey) return;
     const key = event.key.toLowerCase();
@@ -370,6 +497,23 @@ export function DocumentOpener({ path, source }: PluginFileOpenerProps) {
         <span title={selected ? t("quoteSelection") : t("selectToQuote")} className="shrink-0"><Button variant="ghost" size="icon" className="size-8 text-muted-foreground hover:text-foreground" onMouseDown={(event) => event.preventDefault()} onClick={quote} disabled={!selected} aria-label={t("quote")}>
           <Icon name="MessageSquarePlus" className="size-4" />
         </Button></span>
+        {!legacy ? (
+          <span
+            title={editing ? t("cancel") : t("editDocument")}
+            className={cn("shrink-0", editing ? "" : "")}
+          >
+            <Button
+              variant={editing ? "secondary" : "outline"}
+              size="sm"
+              className={cn("h-8 gap-1.5", editing && "border-primary/40 text-primary")}
+              onClick={() => (editing ? cancelEdit() : void openEditor())}
+              disabled={!info || savingDoc}
+              aria-pressed={editing}
+            >
+              <Icon name="EditFile" className="size-4" /> {editing ? t("cancel") : t("editDocument")}
+            </Button>
+          </span>
+        ) : null}
         <span title={t("downloadHint")} className="shrink-0"><Button variant="ghost" size="sm" className="h-8 gap-1.5" onClick={() => void download()} disabled={!info}>
           <Icon name="Download" className="size-4" /> {t("download")}
         </Button></span>
@@ -406,6 +550,61 @@ export function DocumentOpener({ path, source }: PluginFileOpenerProps) {
                   ))}
                 </div>
               ) : null
+            ) : editing && editable ? (
+              <div className="mx-auto w-full max-w-4xl space-y-2 p-3">
+                {editError ? (
+                  <div role="alert" className="flex items-center justify-between gap-2 rounded-md border border-destructive/30 bg-destructive/5 px-3 py-2 text-sm">
+                    <span className="min-w-0 truncate">{editError}</span>
+                    <Button variant="outline" size="sm" onClick={() => void load()}>{t("retry")}</Button>
+                  </div>
+                ) : null}
+                {editable.map((paragraph, index) => (
+                  <div key={index} className="flex items-start gap-2 rounded-md border border-border bg-background p-2">
+                    <div className="w-24 shrink-0">
+                      <select
+                        className="h-8 w-full rounded border border-input bg-transparent px-1 text-xs"
+                        value={paragraph.style}
+                        onChange={(event) => updateEditable(index, { style: event.target.value as DocxParagraphStyle })}
+                        aria-label={t("paragraphStyle")}
+                      >
+                        {STYLE_OPTIONS.map((option) => (
+                          <option key={option.value} value={option.value}>{t(option.labelKey)}</option>
+                        ))}
+                      </select>
+                    </div>
+                    <Textarea
+                      className="min-h-8 flex-1 resize-none text-sm"
+                      rows={Math.max(1, paragraph.text.split("\n").length)}
+                      value={paragraph.text}
+                      onChange={(event) => updateEditable(index, { text: event.target.value })}
+                      placeholder={t("emptyDocument")}
+                      aria-label={t("paragraphStyle")}
+                    />
+                    <div className="flex shrink-0 items-center gap-0.5">
+                      <Button variant="ghost" size="icon" className={cn("size-8 text-muted-foreground", paragraph.bold && "text-foreground")} onClick={() => toggleFormat(index, "bold")} title={t("bold")} aria-pressed={paragraph.bold}>
+                        <span className="text-sm font-bold">B</span>
+                      </Button>
+                      <Button variant="ghost" size="icon" className={cn("size-8 text-muted-foreground", paragraph.italic && "text-foreground")} onClick={() => toggleFormat(index, "italic")} title={t("italic")} aria-pressed={paragraph.italic}>
+                        <span className="text-sm italic">I</span>
+                      </Button>
+                      <Button variant="ghost" size="icon" className="size-8 text-muted-foreground" onClick={() => removeEditable(index)} title={t("deleteParagraph")} aria-label={t("deleteParagraph")}>
+                        <Icon name="X" className="size-4" />
+                      </Button>
+                    </div>
+                  </div>
+                ))}
+                <div className="flex items-center justify-between gap-2 pt-1">
+                  <Button variant="outline" size="sm" onClick={() => addEditable((editable.length ?? 1) - 1)} disabled={savingDoc}>
+                    <Icon name="Plus" className="size-4" /> {t("addParagraph")}
+                  </Button>
+                  <div className="flex items-center gap-2">
+                    <Button variant="ghost" size="sm" onClick={cancelEdit} disabled={savingDoc}>{t("cancel")}</Button>
+                    <Button variant="default" size="sm" onClick={() => void saveEdit()} disabled={savingDoc}>
+                      <Icon name={savingDoc ? "Spinner" : "Check"} className={savingDoc ? "size-4 animate-spin" : "size-4"} /> {t("save")}
+                    </Button>
+                  </div>
+                </div>
+              </div>
             ) : (
               <div ref={pages} hidden={!!error} />
             )}

@@ -42,6 +42,7 @@ import { freeSlidesStem, listedSlidesStem, slidesDir, slidesJsonPath, slidesPngP
 import { loadHugeiconsByNames } from "./src/server/hugeicons.ts";
 import { pdfViewStateSchema } from "./src/pdf/view-state.ts";
 import { deletePdfViewStates, readPdfViewState, writePdfViewState } from "./src/server/pdf-view-state.ts";
+import { extractDocxModel, applyDocxModel } from "./src/word/docx-edit.ts";
 
 const say = (lang: Lang, en: string, ru: string) => (lang === "ru" ? ru : en);
 
@@ -68,6 +69,26 @@ const editSchema = z.discriminatedUnion("kind", [
   z.object({ ...position, kind: z.literal("clear") }).strict(),
 ]);
 
+const docxRunSchema = z
+  .object({
+    text: z.string(),
+    bold: z.boolean().optional(),
+    italic: z.boolean().optional(),
+    underline: z.boolean().optional(),
+    strike: z.boolean().optional(),
+  })
+  .strict();
+const docxParagraphSchema = z
+  .object({
+    style: z.enum(["normal", "title", "subtitle", "heading1", "heading2", "heading3", "heading4", "quote", "listBullet", "listNumber"]),
+    text: z.string(),
+    runs: z.array(docxRunSchema),
+    bullet: z.boolean().optional(),
+    level: z.number().int().min(0).max(9).optional(),
+    align: z.enum(["left", "center", "right", "justify", "both"]).nullable().optional(),
+  })
+  .strict();
+
 export const rpcContract = defineRpcContract({
   /** A short-lived URL the browser downloads the file from, so large files don't travel as JSON. */
   open: {
@@ -89,6 +110,21 @@ export const rpcContract = defineRpcContract({
     output: z
       .object({ hostName: z.string(), absPath: z.string(), sizeBytes: z.number(), body: z.string(), headers: z.string(), footnotes: z.string(), endnotes: z.string() })
       .strict(),
+  },
+  /** Editable structure of a .docx: body paragraphs with style and run formatting. */
+  docxModel: {
+    input: fileSchema,
+    output: z
+      .object({ hostName: z.string(), absPath: z.string(), sizeBytes: z.number(), sha256: z.string(), paragraphs: z.array(docxParagraphSchema) })
+      .strict(),
+  },
+  /** Writes edited .docx paragraphs back into the file, preserving other parts. */
+  saveDocx: {
+    input: fileSchema.extend({ expectedSha256: z.string(), paragraphs: z.array(docxParagraphSchema).min(1) }).strict(),
+    output: z.discriminatedUnion("outcome", [
+      z.object({ outcome: z.literal("written"), sha256: z.string(), sizeBytes: z.number() }).strict(),
+      z.object({ outcome: z.literal("conflict") }).strict(),
+    ]),
   },
   /** The IronCalc WebAssembly module the viewer computes formulas with. */
   engine: { input: z.object({}).strict(), output: z.object({ base64: z.string() }).strict() },
@@ -512,6 +548,35 @@ export default function plugin(bb: BbPluginApi) {
         footnotes: text.getFootnotes(raw),
         endnotes: text.getEndnotes(raw),
       };
+    },
+    docxModel: async ({ source, path, locale = "en" }) => {
+      const where = await locate(sdk, source, path, locale);
+      const hostName = (await bb.sdk.hosts.get({ hostId: where.hostId }).catch(() => null))?.name || where.hostId;
+      const file = await bb.sdk.files
+        .read({ hostId: where.hostId, path: where.absPath })
+        .catch((error: unknown) => { throw describe(error, hostName, where.absPath, locale); });
+      if (!("content" in file)) throw new Error(say(locale, "The server returned no file content.", "Сервер не вернул содержимое файла."));
+      const bytes = new Uint8Array(Buffer.from(file.content, file.contentEncoding === "base64" ? "base64" : "utf8"));
+      if (bytes.byteLength > MAX_BYTES) throw new Error(say(locale, "The file is larger than 30 MB.", "Файл больше 30 МБ."));
+      const { paragraphs } = extractDocxModel(bytes);
+      return { hostName, absPath: where.absPath, sizeBytes: bytes.byteLength, sha256: file.sha256 ?? "", paragraphs };
+    },
+    saveDocx: async ({ source, path, locale = "en", expectedSha256, paragraphs }) => {
+      const where = await locate(sdk, source, path, locale);
+      const hostName = (await bb.sdk.hosts.get({ hostId: where.hostId }).catch(() => null))?.name || where.hostId;
+      const file = await bb.sdk.files
+        .read({ hostId: where.hostId, path: where.absPath })
+        .catch((error: unknown) => { throw describe(error, hostName, where.absPath, locale); });
+      if (!("content" in file)) throw new Error(say(locale, "The server returned no file content.", "Сервер не вернул содержимое файла."));
+      if (file.sha256 !== expectedSha256) return { outcome: "conflict" as const };
+      const bytes = new Uint8Array(Buffer.from(file.content, file.contentEncoding === "base64" ? "base64" : "utf8"));
+      const next = applyDocxModel(bytes, paragraphs);
+      const result = await bb.sdk.files
+        .write({ hostId: where.hostId, path: where.absPath, content: Buffer.from(next).toString("base64"), contentEncoding: "base64", expectedSha256 })
+        .catch((error: unknown) => { throw describe(error, hostName, where.absPath, locale); });
+      if (result.outcome === "conflict") return { outcome: "conflict" as const };
+      bb.log.info(`saved ${paragraphs.length} docx paragraph(s) to ${where.hostId}:${where.absPath}`);
+      return { outcome: "written" as const, sha256: result.sha256, sizeBytes: next.byteLength };
     },
     getPdfViewState: async ({ threadId, source, path, locale = "en" }) => {
       await bb.sdk.threads.get({ threadId });
