@@ -12,7 +12,7 @@ $ErrorActionPreference = "Stop"
 # at the root of its repository. Add more plugin sources here later if you build
 # separate plugins.
 $PluginSources = @(
-  "git:https://github.com/YOUR_USER/bb-office-viewer.git"
+  "git:https://github.com/gaen3erich/bb-office-viewer.git"
 )
 
 Write-Host "Office Viewer — BB plugin installer" -ForegroundColor Cyan

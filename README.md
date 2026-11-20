@@ -14,15 +14,15 @@ A fork of [bb-plugin-office-viewer](https://github.com/VKirill/bb-plugin-office-
 Requires [BB](https://getbb.app) on the machine. On PowerShell:
 
 ```powershell
-# 1. Set the repository URL in setup.ps1 first (it points at YOUR_USER by default)
-# 2. Run the setup script
+# Install everything
 ./setup.ps1
+bb plugin list
 ```
 
 or install it directly:
 
 ```powershell
-bb plugin install git:https://github.com/YOUR_USER/bb-office-viewer.git --yes
+bb plugin install git:https://github.com/gaen3erich/bb-office-viewer.git --yes
 bb plugin list
 ```
 
