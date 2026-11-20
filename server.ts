@@ -76,6 +76,10 @@ const docxRunSchema = z
     italic: z.boolean().optional(),
     underline: z.boolean().optional(),
     strike: z.boolean().optional(),
+    color: z.string().optional(),
+    highlight: z.string().optional(),
+    font: z.string().optional(),
+    size: z.number().optional(),
   })
   .strict();
 const docxParagraphSchema = z

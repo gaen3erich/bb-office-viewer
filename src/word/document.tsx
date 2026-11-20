@@ -58,6 +58,10 @@ type EditableParagraph = {
   italic: boolean;
   underline: boolean;
   strike: boolean;
+  color?: string;
+  highlight?: string;
+  font?: string;
+  size?: number;
 };
 const STYLE_OPTIONS: { value: DocxParagraphStyle; labelKey: I18nKey }[] = [
   { value: "normal", labelKey: "styleNormal" },
@@ -71,10 +75,11 @@ const STYLE_OPTIONS: { value: DocxParagraphStyle; labelKey: I18nKey }[] = [
   { value: "listBullet", labelKey: "styleListBullet" },
   { value: "listNumber", labelKey: "styleListNumber" },
 ];
+type DocxRunLike = { text: string; bold?: boolean; italic?: boolean; underline?: boolean; strike?: boolean; color?: string; highlight?: string; font?: string; size?: number };
 type DocxParagraphLike = {
   style: DocxParagraphStyle;
   text: string;
-  runs: { text: string; bold?: boolean; italic?: boolean; underline?: boolean; strike?: boolean }[];
+  runs: DocxRunLike[];
 };
 const toEditable = (paragraph: DocxParagraphLike): EditableParagraph => ({
   style: paragraph.style,
@@ -83,6 +88,10 @@ const toEditable = (paragraph: DocxParagraphLike): EditableParagraph => ({
   italic: paragraph.runs[0]?.italic ?? false,
   underline: paragraph.runs[0]?.underline ?? false,
   strike: paragraph.runs[0]?.strike ?? false,
+  color: paragraph.runs[0]?.color,
+  highlight: paragraph.runs[0]?.highlight,
+  font: paragraph.runs[0]?.font,
+  size: paragraph.runs[0]?.size,
 });
 
 /** Every case-insensitive occurrence of `needle` in the text under `root`. Runs of one paragraph are searched together, because Word splits its text by formatting. */
@@ -134,6 +143,74 @@ function collectWysiwygParagraphs(root: HTMLElement | null): { text: string }[] 
     out.push({ text: (paragraph.innerText ?? "").replace(/\u00a0/g, " ").replace(BULLET_PATTERN, (glyph: string) => BULLETS[glyph]).trim() });
   });
   return out;
+}
+
+/** The set of run properties the format toolbar can change. */
+type RunFormat = { bold?: boolean; italic?: boolean; underline?: boolean; strike?: boolean; color?: string; highlight?: string; font?: string; size?: number };
+
+const FONT_OPTIONS = ["Calibri", "Arial", "Times New Roman", "Segoe UI", "Verdana", "Georgia", "Courier New", "Tahoma"];
+const SIZE_OPTIONS = [8, 9, 10, 11, 12, 14, 16, 18, 20, 22, 24, 28, 32, 36, 48, 72];
+
+const fromColorInput = (value: string) => value.replace(/^#/, "").toUpperCase();
+const toColorInput = (hex?: string) => (hex ? `#${hex}` : "#000000");
+
+/** The top-level paragraphs rendered by docx-preview (section.docx > p) in document order, excluding tables. */
+function topParagraphElements(root: HTMLElement | null): HTMLElement[] {
+  if (!root) return [];
+  return Array.from(root.querySelectorAll<HTMLElement>("section.docx p")).filter((p) => !p.closest("table"));
+}
+
+/** The index of the paragraph under the current caret/selection, or -1 when there is none. */
+function caretParagraphIndex(root: HTMLElement | null): number {
+  if (!root) return -1;
+  const sel = window.getSelection();
+  if (!sel || !sel.anchorNode || !root.contains(sel.anchorNode)) return -1;
+  const el = sel.anchorNode instanceof Element ? sel.anchorNode.closest<HTMLElement>("section.docx p") : (sel.anchorNode.parentElement?.closest<HTMLElement>("section.docx p") ?? null);
+  if (!el || el.closest("table")) return -1;
+  return topParagraphElements(root).indexOf(el);
+}
+
+function renderRunStyle(span: HTMLElement, run: DocxRunLike) {
+  if (run.bold) span.style.fontWeight = "bold";
+  if (run.italic) span.style.fontStyle = "italic";
+  const decoration = [run.underline ? "underline" : "", run.strike ? "line-through" : ""].filter(Boolean).join(" ");
+  if (decoration) span.style.textDecoration = decoration;
+  if (run.color) span.style.color = `#${run.color}`;
+  if (run.highlight) span.style.backgroundColor = `#${run.highlight}`;
+  if (run.font) span.style.fontFamily = `"${run.font}", sans-serif`;
+  if (run.size) span.style.fontSize = `${run.size}pt`;
+}
+
+/** Replace the children of a rendered paragraph with styled runs (keeps the <p> element and its own layout). */
+function renderParagraphDom(el: HTMLElement, paragraph: DocxParagraphLike) {
+  const fragment = el.ownerDocument.createDocumentFragment();
+  const marker = paragraph.style === "listBullet" ? "• " : paragraph.style === "listNumber" ? "1. " : "";
+  if (marker) {
+    const m = el.ownerDocument.createElement("span");
+    m.style.whiteSpace = "pre";
+    m.textContent = marker;
+    fragment.appendChild(m);
+  }
+  if (!paragraph.runs.length) {
+    const span = el.ownerDocument.createElement("span");
+    span.textContent = paragraph.text;
+    fragment.appendChild(span);
+  }
+  for (const run of paragraph.runs) {
+    const span = el.ownerDocument.createElement("span");
+    renderRunStyle(span, run);
+    span.textContent = run.text;
+    fragment.appendChild(span);
+  }
+  el.replaceChildren(fragment);
+}
+
+/** Normalize paragraph text read from a rendered page, removing the list marker docx-preview inserts for bullet/number lists. */
+function stripListMarker(value: string, style: DocxParagraphStyle): string {
+  const v = value.replace(/\u00a0/g, " ").replace(BULLET_PATTERN, (glyph: string) => BULLETS[glyph]).trim();
+  if (style === "listBullet") return v.replace(/^[•▪□❖➢✓→]+\s*/, "");
+  if (style === "listNumber") return v.replace(/^\d+[\.\)]\s*/, "");
+  return v;
 }
 
 export function DocumentOpener({ path, source }: PluginFileOpenerProps) {
@@ -389,6 +466,42 @@ export function DocumentOpener({ path, source }: PluginFileOpenerProps) {
     setEditable((previous) => (previous ? previous.map((paragraph, i) => (i === index ? { ...paragraph, [key]: !paragraph[key] } : paragraph)) : previous));
   };
 
+  // WYSIWYG formatting: modify the model paragraph under the caret and re-render its DOM for immediate feedback.
+  const applyWysiwygFormat = (patch: RunFormat) => {
+    if (!baseParagraphs || !pages.current) return;
+    const index = caretParagraphIndex(pages.current);
+    if (index < 0) return;
+    const current = baseParagraphs[index];
+    const updated: DocxParagraphLike = { ...current, runs: current.runs.map((run) => ({ ...run, ...patch })) };
+    setBaseParagraphs((prev) => (prev ? prev.map((paragraph, i) => (i === index ? updated : paragraph)) : prev));
+    const el = topParagraphElements(pages.current)[index];
+    if (el) renderParagraphDom(el, updated);
+  };
+
+  const toggleWysiwyg = (key: "bold" | "italic" | "underline" | "strike") => {
+    if (!baseParagraphs || !pages.current) return;
+    const index = caretParagraphIndex(pages.current);
+    if (index < 0) return;
+    const current = baseParagraphs[index].runs[0]?.[key] ?? false;
+    applyWysiwygFormat({ [key]: !current });
+  };
+
+  const setWysiwygColor = (hex: string) => applyWysiwygFormat({ color: fromColorInput(hex) });
+  const setWysiwygHighlight = (hex: string) => applyWysiwygFormat({ highlight: fromColorInput(hex) });
+  const setWysiwygFont = (font: string) => applyWysiwygFormat({ font: font || undefined });
+  const setWysiwygSize = (size: string) => applyWysiwygFormat({ size: size ? Number(size) : undefined });
+
+  const setWysiwygList = (style: DocxParagraphStyle) => {
+    if (!baseParagraphs || !pages.current) return;
+    const index = caretParagraphIndex(pages.current);
+    if (index < 0) return;
+    const current = baseParagraphs[index];
+    const updated: DocxParagraphLike = { ...current, style: current.style === style ? "normal" : style };
+    setBaseParagraphs((prev) => (prev ? prev.map((paragraph, i) => (i === index ? updated : paragraph)) : prev));
+    const el = topParagraphElements(pages.current)[index];
+    if (el) renderParagraphDom(el, updated);
+  };
+
   const addEditable = (index: number) => {
     setEditable((previous) =>
       previous
@@ -425,6 +538,10 @@ export function DocumentOpener({ path, source }: PluginFileOpenerProps) {
             italic: paragraph.italic,
             underline: paragraph.underline,
             strike: paragraph.strike,
+            ...(paragraph.color ? { color: paragraph.color } : {}),
+            ...(paragraph.highlight ? { highlight: paragraph.highlight } : {}),
+            ...(paragraph.font ? { font: paragraph.font } : {}),
+            ...(paragraph.size ? { size: paragraph.size } : {}),
           },
         ],
         bullet: paragraph.style === "listBullet" || paragraph.style === "listNumber",
@@ -456,8 +573,9 @@ export function DocumentOpener({ path, source }: PluginFileOpenerProps) {
     try {
       const dom = collectWysiwygParagraphs(pages.current);
       const paragraphs = baseParagraphs.map((paragraph, index) => {
-        const text = (dom[index]?.text ?? paragraph.text).trim();
         const bullet = paragraph.style === "listBullet" || paragraph.style === "listNumber";
+        const rawText = dom[index]?.text ?? paragraph.text;
+        const text = bullet ? stripListMarker(rawText, paragraph.style) : rawText.trim();
         if (text === paragraph.text) {
           return { ...paragraph, bullet, level: 0, align: null };
         }
@@ -472,6 +590,10 @@ export function DocumentOpener({ path, source }: PluginFileOpenerProps) {
               italic: first?.italic ?? false,
               underline: first?.underline ?? false,
               strike: first?.strike ?? false,
+              ...(first?.color ? { color: first.color } : {}),
+              ...(first?.highlight ? { highlight: first.highlight } : {}),
+              ...(first?.font ? { font: first.font } : {}),
+              ...(first?.size ? { size: first.size } : {}),
             },
           ],
           bullet,
@@ -521,6 +643,9 @@ export function DocumentOpener({ path, source }: PluginFileOpenerProps) {
 
   const extra = text ? [text.headers, text.footnotes, text.endnotes].map((part) => part.trim()).filter(Boolean) : [];
   const ready = !!info && !error;
+  const wysiwygIndex = editing && editMode === "wysiwyg" ? caretParagraphIndex(pages.current ?? null) : -1;
+  const activeWysiwygRun = wysiwygIndex >= 0 ? baseParagraphs?.[wysiwygIndex]?.runs[0] : undefined;
+  const activeWysiwygStyle = wysiwygIndex >= 0 ? baseParagraphs?.[wysiwygIndex]?.style : undefined;
 
   return (
     <div className="flex h-full min-h-0 flex-col bg-background outline-none" tabIndex={0} onKeyDown={onKeyDown}>
@@ -601,6 +726,41 @@ export function DocumentOpener({ path, source }: PluginFileOpenerProps) {
         </Button></span>
       </div>
 
+      {editing && editMode === "wysiwyg" ? (
+        <div className="flex flex-wrap items-center gap-1 border-b border-border px-2 py-1" onMouseDown={(event) => event.preventDefault()}>
+          <Button variant="ghost" size="icon" className={cn("size-8", activeWysiwygRun?.bold ? "text-foreground" : "text-muted-foreground")} onClick={() => toggleWysiwyg("bold")} title={t("bold")} aria-pressed={!!activeWysiwygRun?.bold}>
+            <span className="text-sm font-bold">B</span>
+          </Button>
+          <Button variant="ghost" size="icon" className={cn("size-8", activeWysiwygRun?.italic ? "text-foreground" : "text-muted-foreground")} onClick={() => toggleWysiwyg("italic")} title={t("italic")} aria-pressed={!!activeWysiwygRun?.italic}>
+            <span className="text-sm italic">I</span>
+          </Button>
+          <Button variant="ghost" size="icon" className={cn("size-8", activeWysiwygRun?.underline ? "text-foreground" : "text-muted-foreground")} onClick={() => toggleWysiwyg("underline")} title={t("underline")} aria-pressed={!!activeWysiwygRun?.underline}>
+            <span className="text-sm underline">U</span>
+          </Button>
+          <Button variant="ghost" size="icon" className={cn("size-8", activeWysiwygRun?.strike ? "text-foreground" : "text-muted-foreground")} onClick={() => toggleWysiwyg("strike")} title={t("strikethrough")} aria-pressed={!!activeWysiwygRun?.strike}>
+            <span className="text-sm line-through">S</span>
+          </Button>
+          <span className="mx-1 h-5 w-px shrink-0 bg-border" />
+          <span title={t("textColor")} className="flex items-center gap-1"><input type="color" className="h-6 w-6 cursor-pointer rounded border border-input bg-transparent" value={toColorInput(activeWysiwygRun?.color)} onChange={(event) => setWysiwygColor(event.target.value)} aria-label={t("textColor")} /></span>
+          <span title={t("highlightColor")} className="flex items-center gap-1"><input type="color" className="h-6 w-6 cursor-pointer rounded border border-input bg-transparent" value={toColorInput(activeWysiwygRun?.highlight)} onChange={(event) => setWysiwygHighlight(event.target.value)} aria-label={t("highlightColor")} /></span>
+          <span title={t("font")} className="flex items-center gap-1"><select className="h-7 rounded border border-input bg-transparent px-1 text-xs" value={activeWysiwygRun?.font ?? ""} onChange={(event) => setWysiwygFont(event.target.value)} aria-label={t("font")}>
+            <option value="">{t("font")}</option>
+            {FONT_OPTIONS.map((font) => <option key={font} value={font}>{font}</option>)}
+          </select></span>
+          <span title={t("fontSize")} className="flex items-center gap-1"><select className="h-7 rounded border border-input bg-transparent px-1 text-xs" value={activeWysiwygRun?.size ?? ""} onChange={(event) => setWysiwygSize(event.target.value)} aria-label={t("fontSize")}>
+            <option value="">{t("fontSize")}</option>
+            {SIZE_OPTIONS.map((size) => <option key={size} value={size}>{size}pt</option>)}
+          </select></span>
+          <span className="mx-1 h-5 w-px shrink-0 bg-border" />
+          <Button variant="ghost" size="icon" className={cn("size-8", activeWysiwygStyle === "listBullet" ? "text-foreground" : "text-muted-foreground")} onClick={() => setWysiwygList("listBullet")} title={t("bulletList")} aria-pressed={activeWysiwygStyle === "listBullet"}>
+            <Icon name="ListView" className="size-4" />
+          </Button>
+          <Button variant="ghost" size="icon" className={cn("size-8", activeWysiwygStyle === "listNumber" ? "text-foreground" : "text-muted-foreground")} onClick={() => setWysiwygList("listNumber")} title={t("numberList")} aria-pressed={activeWysiwygStyle === "listNumber"}>
+            <span className="text-sm font-semibold">#</span>
+          </Button>
+        </div>
+      ) : null}
+
       {legacy && text ? (
         <div role="note" className="shrink-0 border-b border-border bg-muted/40 px-3 py-1.5 text-xs text-muted-foreground">{t("legacyDoc")}</div>
       ) : null}
@@ -638,36 +798,62 @@ export function DocumentOpener({ path, source }: PluginFileOpenerProps) {
                   </div>
                 ) : null}
                 {editable.map((paragraph, index) => (
-                  <div key={index} className="flex items-start gap-2 rounded-md border border-border bg-background p-2">
-                    <div className="w-24 shrink-0">
-                      <select
-                        className="h-8 w-full rounded border border-input bg-transparent px-1 text-xs"
-                        value={paragraph.style}
-                        onChange={(event) => updateEditable(index, { style: event.target.value as DocxParagraphStyle })}
+                  <div key={index} className="rounded-md border border-border bg-background p-2">
+                    <div className="flex items-start gap-2">
+                      <div className="w-24 shrink-0">
+                        <select
+                          className="h-8 w-full rounded border border-input bg-transparent px-1 text-xs"
+                          value={paragraph.style}
+                          onChange={(event) => updateEditable(index, { style: event.target.value as DocxParagraphStyle })}
+                          aria-label={t("paragraphStyle")}
+                        >
+                          {STYLE_OPTIONS.map((option) => (
+                            <option key={option.value} value={option.value}>{t(option.labelKey)}</option>
+                          ))}
+                        </select>
+                      </div>
+                      <Textarea
+                        className="min-h-8 flex-1 resize-none text-sm"
+                        rows={Math.max(1, paragraph.text.split("\n").length)}
+                        value={paragraph.text}
+                        onChange={(event) => updateEditable(index, { text: event.target.value })}
+                        placeholder={t("emptyDocument")}
                         aria-label={t("paragraphStyle")}
-                      >
-                        {STYLE_OPTIONS.map((option) => (
-                          <option key={option.value} value={option.value}>{t(option.labelKey)}</option>
-                        ))}
-                      </select>
+                      />
+                      <div className="flex shrink-0 items-center gap-0.5">
+                        <Button variant="ghost" size="icon" className={cn("size-8 text-muted-foreground", paragraph.bold && "text-foreground")} onClick={() => toggleFormat(index, "bold")} title={t("bold")} aria-pressed={paragraph.bold}>
+                          <span className="text-sm font-bold">B</span>
+                        </Button>
+                        <Button variant="ghost" size="icon" className={cn("size-8 text-muted-foreground", paragraph.italic && "text-foreground")} onClick={() => toggleFormat(index, "italic")} title={t("italic")} aria-pressed={paragraph.italic}>
+                          <span className="text-sm italic">I</span>
+                        </Button>
+                        <Button variant="ghost" size="icon" className={cn("size-8 text-muted-foreground", paragraph.underline && "text-foreground")} onClick={() => toggleFormat(index, "underline")} title={t("underline")} aria-pressed={paragraph.underline}>
+                          <span className="text-sm underline">U</span>
+                        </Button>
+                        <Button variant="ghost" size="icon" className={cn("size-8 text-muted-foreground", paragraph.strike && "text-foreground")} onClick={() => toggleFormat(index, "strike")} title={t("strikethrough")} aria-pressed={paragraph.strike}>
+                          <span className="text-sm line-through">S</span>
+                        </Button>
+                        <Button variant="ghost" size="icon" className="size-8 text-muted-foreground" onClick={() => removeEditable(index)} title={t("deleteParagraph")} aria-label={t("deleteParagraph")}>
+                          <Icon name="X" className="size-4" />
+                        </Button>
+                      </div>
                     </div>
-                    <Textarea
-                      className="min-h-8 flex-1 resize-none text-sm"
-                      rows={Math.max(1, paragraph.text.split("\n").length)}
-                      value={paragraph.text}
-                      onChange={(event) => updateEditable(index, { text: event.target.value })}
-                      placeholder={t("emptyDocument")}
-                      aria-label={t("paragraphStyle")}
-                    />
-                    <div className="flex shrink-0 items-center gap-0.5">
-                      <Button variant="ghost" size="icon" className={cn("size-8 text-muted-foreground", paragraph.bold && "text-foreground")} onClick={() => toggleFormat(index, "bold")} title={t("bold")} aria-pressed={paragraph.bold}>
-                        <span className="text-sm font-bold">B</span>
+                    <div className="mt-2 flex flex-wrap items-center gap-2">
+                      <span title={t("textColor")} className="flex items-center gap-1"><input type="color" className="h-6 w-6 cursor-pointer rounded border border-input bg-transparent" value={toColorInput(paragraph.color)} onChange={(event) => updateEditable(index, { color: fromColorInput(event.target.value) })} aria-label={t("textColor")} /></span>
+                      <span title={t("highlightColor")} className="flex items-center gap-1"><input type="color" className="h-6 w-6 cursor-pointer rounded border border-input bg-transparent" value={toColorInput(paragraph.highlight)} onChange={(event) => updateEditable(index, { highlight: fromColorInput(event.target.value) })} aria-label={t("highlightColor")} /></span>
+                      <span title={t("font")} className="flex items-center gap-1"><select className="h-7 rounded border border-input bg-transparent px-1 text-xs" value={paragraph.font ?? ""} onChange={(event) => updateEditable(index, { font: event.target.value }) } aria-label={t("font")}>
+                        <option value="">{t("font")}</option>
+                        {FONT_OPTIONS.map((font) => <option key={font} value={font}>{font}</option>)}
+                      </select></span>
+                      <span title={t("fontSize")} className="flex items-center gap-1"><select className="h-7 rounded border border-input bg-transparent px-1 text-xs" value={paragraph.size ?? ""} onChange={(event) => updateEditable(index, { size: event.target.value ? Number(event.target.value) : undefined })} aria-label={t("fontSize")}>
+                        <option value="">{t("fontSize")}</option>
+                        {SIZE_OPTIONS.map((size) => <option key={size} value={size}>{size}pt</option>)}
+                      </select></span>
+                      <Button variant="ghost" size="sm" className={cn("h-7 gap-1 text-xs", paragraph.style === "listBullet" ? "text-foreground" : "text-muted-foreground")} onClick={() => updateEditable(index, { style: paragraph.style === "listBullet" ? "normal" : "listBullet" })} title={t("bulletList")} aria-pressed={paragraph.style === "listBullet"}>
+                        <Icon name="ListView" className="size-4" /> {t("bulletList")}
                       </Button>
-                      <Button variant="ghost" size="icon" className={cn("size-8 text-muted-foreground", paragraph.italic && "text-foreground")} onClick={() => toggleFormat(index, "italic")} title={t("italic")} aria-pressed={paragraph.italic}>
-                        <span className="text-sm italic">I</span>
-                      </Button>
-                      <Button variant="ghost" size="icon" className="size-8 text-muted-foreground" onClick={() => removeEditable(index)} title={t("deleteParagraph")} aria-label={t("deleteParagraph")}>
-                        <Icon name="X" className="size-4" />
+                      <Button variant="ghost" size="sm" className={cn("h-7 gap-1 text-xs", paragraph.style === "listNumber" ? "text-foreground" : "text-muted-foreground")} onClick={() => updateEditable(index, { style: paragraph.style === "listNumber" ? "normal" : "listNumber" })} title={t("numberList")} aria-pressed={paragraph.style === "listNumber"}>
+                        <span className="text-sm font-semibold">#</span> {t("numberList")}
                       </Button>
                     </div>
                   </div>

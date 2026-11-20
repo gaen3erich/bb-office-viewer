@@ -17,6 +17,14 @@ export type DocxRun = {
   italic?: boolean;
   underline?: boolean;
   strike?: boolean;
+  /** Text color as a hex string without a leading '#' (e.g. "FF0000"). */
+  color?: string;
+  /** Background / highlight color as a hex string without a leading '#' (e.g. "FFFF00"). */
+  highlight?: string;
+  /** Font family name (e.g. "Arial", "Times New Roman"). */
+  font?: string;
+  /** Font size in points (e.g. 12). */
+  size?: number;
 };
 
 export type DocxParagraphStyle = "normal" | "title" | "subtitle" | "heading1" | "heading2" | "heading3" | "heading4" | "quote" | "listBullet" | "listNumber";
@@ -64,7 +72,7 @@ function styleFromId(id: string | null | undefined): DocxParagraphStyle {
 
 function directChildren(node: any, local: string): any[] {
   if (!node) return [];
-  return Array.from(node.childNodes ?? []).filter((child) => child.localName === local);
+  return (Array.from(node.childNodes ?? []) as any[]).filter((child) => child.localName === local);
 }
 
 function firstChild(node: any, local: string): any | null {
@@ -75,9 +83,29 @@ function textOfElement(node: any): string {
   return node?.textContent ?? "";
 }
 
+/** Normalize a colour value to an upper-case hex string without a leading '#'. Returns undefined for empty values. */
+function normalizeColor(value: string | null | undefined): string | undefined {
+  const v = (value ?? "").replace(/^#/, "").trim().toUpperCase();
+  return v ? v : undefined;
+}
+
+/** Word highlight colour names mapped to hex, the only values w:highlight accepts. */
+const HIGHLIGHT_HEX: Record<string, string> = {
+  yellow: "FFFF00", green: "00FF00", cyan: "00FFFF", magenta: "FF00FF", blue: "0000FF", red: "FF0000",
+  darkblue: "000080", darkcyan: "008080", darkgreen: "008000", darkmagenta: "800080",
+  darkred: "800000", darkyellow: "808000", darkgray: "808080", lightgray: "D3D3D3", black: "000000", white: "FFFFFF",
+};
+
+/** Convert a Word highlight name to a hex colour when known; otherwise pass the value through. */
+function highlightHex(value: string | null | undefined): string | undefined {
+  const v = (value ?? "").trim().toLowerCase();
+  if (!v) return undefined;
+  return HIGHLIGHT_HEX[v] ?? normalizeColor(v);
+}
+
 function extractRun(node: any): DocxRun {
   const textParts: string[] = [];
-  for (const child of Array.from(node.childNodes ?? [])) {
+  for (const child of Array.from(node.childNodes ?? []) as any[]) {
     if (child.localName === "t") textParts.push(textOfElement(child));
     else if (child.localName === "tab") textParts.push("\t");
     else if (child.localName === "br" || child.localName === "cr") textParts.push("\n");
@@ -85,13 +113,28 @@ function extractRun(node: any): DocxRun {
   }
   const rPr = firstChild(node, "rPr");
   const has = (local: string) => !!rPr && directChildren(rPr, local).length > 0;
-  return {
+  const run: DocxRun = {
     text: textParts.join(""),
     bold: has("b") || has("bCs"),
     italic: has("i") || has("iCs"),
     underline: has("u"),
     strike: has("strike") || has("dstrike"),
   };
+  if (rPr) {
+    const color = normalizeColor(firstChild(rPr, "color")?.getAttribute("w:val"));
+    if (color) run.color = color;
+    const fonts = firstChild(rPr, "rFonts");
+    const font = fonts?.getAttribute("w:ascii") ?? fonts?.getAttribute("w:hAnsi") ?? null;
+    if (font) run.font = font;
+    const sz = firstChild(rPr, "sz")?.getAttribute("w:val");
+    const size = sz == null ? null : Math.round(parseInt(sz, 10) / 2);
+    if (size) run.size = size;
+    const shdFill = normalizeColor(firstChild(rPr, "shd")?.getAttribute("w:fill"));
+    const highlight = highlightHex(firstChild(rPr, "highlight")?.getAttribute("w:val"));
+    const background = shdFill ?? highlight;
+    if (background) run.highlight = background;
+  }
+  return run;
 }
 
 function extractParagraph(node: any): DocxParagraph {
@@ -150,27 +193,50 @@ export function applyDocxModel(bytes: Uint8Array, paragraphs: DocxParagraph[]): 
   return zipSync(files);
 }
 
+function formatSignature(run: DocxRun | undefined): string {
+  return [run?.bold ?? false, run?.italic ?? false, run?.underline ?? false, run?.strike ?? false, run?.color ?? "", run?.highlight ?? "", run?.font ?? "", run?.size ?? 0].join("|");
+}
+
+function runsDiffer(paraRuns: DocxRun[], beforeRuns: DocxRun[]): boolean {
+  if (paraRuns.length === 0) return false;
+  // The format toolbar always rewrites the whole paragraph, so comparing the first
+  // run's formatting is sufficient and avoids flattening mixed formatting on no-op.
+  return formatSignature(paraRuns[0]) !== formatSignature(beforeRuns[0]);
+}
+
 function applyToParagraph(node: any, para: DocxParagraph): void {
   const before = extractParagraph(node);
-  // Text unchanged: keep the original runs (and any embedded fields/hyperlinks) intact.
-  if (para.text === before.text && para.style === before.style) return;
+  const textChanged = para.text !== before.text;
+  const styleChanged = para.style !== before.style;
+  const formatChanged = runsDiffer(para.runs, before.runs);
+  // Nothing changed: leave the original runs (and any embedded fields/hyperlinks) intact.
+  if (!textChanged && !styleChanged && !formatChanged) return;
 
   // Ensure a pPr exists and apply the requested style.
   const pPr = firstChild(node, "pPr") ?? createElement(node.ownerDocument, "w:pPr", W);
   applyStyleToPPr(pPr, para.style);
   if (pPr.parentNode !== node) node.insertBefore(pPr, node.firstChild);
 
-  // Replace the runs with a single run carrying the requested formatting.
+  // Replace the runs. Formatting-only changes (from the WYSIWYG toolbar) keep the
+  // individual runs so existing mixed formatting is preserved; text/style edits are
+  // collapsed to a single run carrying the requested formatting.
+  const runsToWrite = formatChanged && !textChanged ? para.runs : [para.runs[0] ?? { ...before.runs[0], text: para.text }];
   for (const runNode of directChildren(node, "r")) node.removeChild(runNode);
-
-  const first = para.runs[0] ?? before.runs[0];
-  const run = createRun(node.ownerDocument, para.text, {
-    bold: first?.bold,
-    italic: first?.italic,
-    underline: first?.underline,
-    strike: first?.strike,
-  });
-  node.insertBefore(run, pPr.nextSibling ?? null);
+  const ref = pPr.nextSibling ?? null;
+  for (const source of runsToWrite) {
+    if (!source) continue;
+    const run = createRun(node.ownerDocument, source.text ?? para.text, {
+      bold: source.bold,
+      italic: source.italic,
+      underline: source.underline,
+      strike: source.strike,
+      color: source.color,
+      highlight: source.highlight,
+      font: source.font,
+      size: source.size,
+    });
+    node.insertBefore(run, ref);
+  }
 }
 
 function applyStyleToPPr(pPr: any, style: DocxParagraphStyle): void {
@@ -189,13 +255,24 @@ function applyStyleToPPr(pPr: any, style: DocxParagraphStyle): void {
   }
 }
 
-function createRun(doc: any, text: string, props: { bold?: boolean; italic?: boolean; underline?: boolean; strike?: boolean }): any {
+function createRun(
+  doc: any,
+  text: string,
+  props: { bold?: boolean; italic?: boolean; underline?: boolean; strike?: boolean; color?: string; highlight?: string; font?: string; size?: number },
+): any {
   const run = createElement(doc, "w:r", W);
   const rPr = createElement(doc, "w:rPr", W);
   if (props.bold) { rPr.appendChild(createElement(doc, "w:b", W)); rPr.appendChild(createElement(doc, "w:bCs", W)); }
   if (props.italic) { rPr.appendChild(createElement(doc, "w:i", W)); rPr.appendChild(createElement(doc, "w:iCs", W)); }
   if (props.underline) { const u = createElement(doc, "w:u", W); u.setAttribute("w:val", "single"); rPr.appendChild(u); }
   if (props.strike) { rPr.appendChild(createElement(doc, "w:strike", W)); }
+  if (props.color) { const c = createElement(doc, "w:color", W); c.setAttribute("w:val", props.color); rPr.appendChild(c); }
+  if (props.highlight) { const shd = createElement(doc, "w:shd", W); shd.setAttribute("w:val", "clear"); shd.setAttribute("w:color", "auto"); shd.setAttribute("w:fill", props.highlight); rPr.appendChild(shd); }
+  if (props.font) { const f = createElement(doc, "w:rFonts", W); f.setAttribute("w:ascii", props.font); f.setAttribute("w:hAnsi", props.font); f.setAttribute("w:cs", props.font); rPr.appendChild(f); }
+  if (props.size) {
+    const s = createElement(doc, "w:sz", W); s.setAttribute("w:val", String(props.size * 2)); rPr.appendChild(s);
+    const sc = createElement(doc, "w:szCs", W); sc.setAttribute("w:val", String(props.size * 2)); rPr.appendChild(sc);
+  }
   if (rPr.childNodes.length > 0) run.appendChild(rPr);
   const t = createElement(doc, "w:t", W);
   t.setAttribute("xml:space", "preserve");
