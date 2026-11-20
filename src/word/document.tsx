@@ -3,7 +3,7 @@
 // extracts its text and the viewer shows that. Both can be searched, zoomed
 // and quoted into the chat.
 import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
-import type { KeyboardEvent } from "react";
+import type { CSSProperties, KeyboardEvent } from "react";
 import { useComposer, useRpc, type PluginFileOpenerProps } from "@get-bb/plugin-sdk/app";
 import { renderAsync } from "docx-preview";
 import { toast } from "sonner";
@@ -30,6 +30,13 @@ const BULLET_PATTERN = new RegExp(`[${Object.keys(BULLETS).join("")}]`, "g");
 const HIGHLIGHT = "office-find";
 const HIGHLIGHT_CURRENT = "office-find-current";
 const HIGHLIGHT_CSS = `::highlight(${HIGHLIGHT}){background-color:#fde68a;color:#000}::highlight(${HIGHLIGHT_CURRENT}){background-color:#f59e0b;color:#000}`;
+/** Force a stable compositing layer on the editable root so text does not go blurry when Chromium/Electron makes it contenteditable inside a zoomed page. */
+const WYSIWYG_EDIT_STYLE: CSSProperties = {
+  transform: "translateZ(0)",
+  willChange: "transform",
+  textRendering: "geometricPrecision",
+  WebkitFontSmoothing: "antialiased",
+};
 const ZOOM_STEPS = [0.25, 0.33, 0.5, 0.67, 0.75, 0.9, 1, 1.1, 1.25, 1.5, 1.75, 2, 2.5, 3];
 /** The browser's highlight registry (typed as a Map: the DOM typings leave out its methods), or null where unsupported. */
 const highlightRegistry = () => (typeof CSS !== "undefined" && "highlights" in CSS ? (CSS.highlights as unknown as Map<string, Highlight>) : null);
@@ -877,6 +884,7 @@ export function DocumentOpener({ path, source }: PluginFileOpenerProps) {
                 contentEditable={editing && editMode === "wysiwyg"}
                 suppressContentEditableWarning
                 className={cn(editing && editMode === "wysiwyg" && "rounded-sm ring-2 ring-primary/30")}
+                style={editing && editMode === "wysiwyg" ? WYSIWYG_EDIT_STYLE : undefined}
               />
             )}
           </div>
