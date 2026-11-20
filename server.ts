@@ -552,31 +552,41 @@ export default function plugin(bb: BbPluginApi) {
     docxModel: async ({ source, path, locale = "en" }) => {
       const where = await locate(sdk, source, path, locale);
       const hostName = (await bb.sdk.hosts.get({ hostId: where.hostId }).catch(() => null))?.name || where.hostId;
-      const file = await bb.sdk.files
-        .read({ hostId: where.hostId, path: where.absPath })
-        .catch((error: unknown) => { throw describe(error, hostName, where.absPath, locale); });
-      if (!("content" in file)) throw new Error(say(locale, "The server returned no file content.", "Сервер не вернул содержимое файла."));
-      const bytes = new Uint8Array(Buffer.from(file.content, file.contentEncoding === "base64" ? "base64" : "utf8"));
-      if (bytes.byteLength > MAX_BYTES) throw new Error(say(locale, "The file is larger than 30 MB.", "Файл больше 30 МБ."));
-      const { paragraphs } = extractDocxModel(bytes);
-      return { hostName, absPath: where.absPath, sizeBytes: bytes.byteLength, sha256: file.sha256 ?? "", paragraphs };
+      try {
+        const file = await bb.sdk.files
+          .read({ hostId: where.hostId, path: where.absPath })
+          .catch((error: unknown) => { throw describe(error, hostName, where.absPath, locale); });
+        if (!("content" in file)) throw new Error(say(locale, "The server returned no file content.", "Сервер не вернул содержимое файла."));
+        const bytes = new Uint8Array(Buffer.from(file.content, file.contentEncoding === "base64" ? "base64" : "utf8"));
+        if (bytes.byteLength > MAX_BYTES) throw new Error(say(locale, "The file is larger than 30 MB.", "Файл больше 30 МБ."));
+        const { paragraphs } = extractDocxModel(bytes);
+        bb.log.info(`[docxModel] extracted ${paragraphs.length} paragraph(s) from ${where.hostId}:${where.absPath}`);
+        return { hostName, absPath: where.absPath, sizeBytes: bytes.byteLength, sha256: file.sha256 ?? "", paragraphs };
+      } catch (error) {
+        bb.log.error(`[docxModel] failed for ${where.hostId}:${where.absPath}: ${error instanceof Error ? error.message : String(error)}`);
+        throw error;
+      }
     },
     saveDocx: async ({ source, path, locale = "en", expectedSha256, paragraphs }) => {
       const where = await locate(sdk, source, path, locale);
       const hostName = (await bb.sdk.hosts.get({ hostId: where.hostId }).catch(() => null))?.name || where.hostId;
-      const file = await bb.sdk.files
-        .read({ hostId: where.hostId, path: where.absPath })
-        .catch((error: unknown) => { throw describe(error, hostName, where.absPath, locale); });
-      if (!("content" in file)) throw new Error(say(locale, "The server returned no file content.", "Сервер не вернул содержимое файла."));
-      if (file.sha256 !== expectedSha256) return { outcome: "conflict" as const };
-      const bytes = new Uint8Array(Buffer.from(file.content, file.contentEncoding === "base64" ? "base64" : "utf8"));
-      const next = applyDocxModel(bytes, paragraphs);
-      const result = await bb.sdk.files
-        .write({ hostId: where.hostId, path: where.absPath, content: Buffer.from(next).toString("base64"), contentEncoding: "base64", expectedSha256 })
-        .catch((error: unknown) => { throw describe(error, hostName, where.absPath, locale); });
-      if (result.outcome === "conflict") return { outcome: "conflict" as const };
-      bb.log.info(`saved ${paragraphs.length} docx paragraph(s) to ${where.hostId}:${where.absPath}`);
-      return { outcome: "written" as const, sha256: result.sha256, sizeBytes: next.byteLength };
+      try {
+        const file = await bb.sdk.files
+          .read({ hostId: where.hostId, path: where.absPath })
+          .catch((error: unknown) => { throw describe(error, hostName, where.absPath, locale); });
+        if (!("content" in file)) throw new Error(say(locale, "The server returned no file content.", "Сервер не вернул содержимое файла."));
+        if (file.sha256 !== expectedSha256) return { outcome: "conflict" as const };
+        const bytes = new Uint8Array(Buffer.from(file.content, file.contentEncoding === "base64" ? "base64" : "utf8"));
+        const next = applyDocxModel(bytes, paragraphs);
+        const result = await bb.sdk.files
+          .write({ hostId: where.hostId, path: where.absPath, content: Buffer.from(next).toString("base64"), contentEncoding: "base64", expectedSha256 })
+          .catch((error: unknown) => { throw describe(error, hostName, where.absPath, locale); });
+        bb.log.info(`[saveDocx] ${result.outcome === "conflict" ? "conflict" : `written ${paragraphs.length} paragraph(s)`} for ${where.hostId}:${where.absPath}`);
+        return result.outcome === "conflict" ? { outcome: "conflict" as const } : { outcome: "written" as const, sha256: result.sha256, sizeBytes: next.byteLength };
+      } catch (error) {
+        bb.log.error(`[saveDocx] failed for ${where.hostId}:${where.absPath}: ${error instanceof Error ? error.message : String(error)}`);
+        throw error;
+      }
     },
     getPdfViewState: async ({ threadId, source, path, locale = "en" }) => {
       await bb.sdk.threads.get({ threadId });

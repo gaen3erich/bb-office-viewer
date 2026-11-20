@@ -398,10 +398,10 @@ export function DocumentOpener({ path, source }: PluginFileOpenerProps) {
         runs: [
           {
             text: paragraph.text,
-            bold: paragraph.bold || undefined,
-            italic: paragraph.italic || undefined,
-            underline: paragraph.underline || undefined,
-            strike: paragraph.strike || undefined,
+            bold: paragraph.bold,
+            italic: paragraph.italic,
+            underline: paragraph.underline,
+            strike: paragraph.strike,
           },
         ],
         bullet: paragraph.style === "listBullet" || paragraph.style === "listNumber",
